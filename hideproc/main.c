@@ -94,9 +94,11 @@ void hook_remove(struct ftrace_hook *hook)
     int err = unregister_ftrace_function(&hook->ops);
     if (err)
         printk("unregister_ftrace_function() failed: %d\n", err);
+#if 0
     err = ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
     if (err)
         printk("ftrace_set_filter_ip() failed: %d\n", err);
+#endif
 }
 #endif
 
@@ -161,7 +163,7 @@ static int unhide_process(pid_t pid)
     return SUCCESS;
 }
 
-#define OUTPUT_BUFFER_FORMAT "pid: %4d\n"
+#define OUTPUT_BUFFER_FORMAT "pid: %6d\n"
 #define MAX_MESSAGE_SIZE (sizeof(OUTPUT_BUFFER_FORMAT) + 4)
 #define MAX_WRITE_BUFFER_SIZE 1024
 
@@ -214,8 +216,8 @@ static ssize_t device_write(struct file *filep,
 	    return -EINVAL;
     }
 
-#ifdef DEBUG
-    print_hex_dump_bytes(KERN_DEBUG, "input buffer", DUMP_PREFIX_ADDRESS, buffer, len);
+#if defined(DEBUG) && defined(CONFIG_PRINTK)
+    print_hex_dump(KERN_DEBUG, "input buffer", DUMP_PREFIX_ADDRESS, 32,4,buffer, len,0);
 #endif
 
     message = kmalloc(len + 1, GFP_KERNEL);
@@ -229,8 +231,8 @@ static ssize_t device_write(struct file *filep,
     while (p < message+len && q!= NULL) {
 	    *q = '\0';
 
-#ifdef DEBUG
-    print_hex_dump_bytes(KERN_DEBUG,"partial string", DUMP_PREFIX_ADDRESS, p, q-p+1);
+#if defined(DEBUG) && defined(CONFIG_PRINTK)
+    print_hex_dump(KERN_DEBUG,"partial string", DUMP_PREFIX_ADDRESS, 32, 4, p, q-p+1,0);
 #endif
 
     if (!memcmp(p, add_message, sizeof(add_message) - 1)) {
@@ -285,11 +287,11 @@ static const struct file_operations fops = {
 
 
 int dev_major;
+    dev_t dev;
 
 static int _hideproc_init(void)
 {
-    int err, dev_major;
-    dev_t dev;
+    int err;
     printk(KERN_INFO "@ %s\n", __func__);
     err = alloc_chrdev_region(&dev, 0, MINOR_VERSION, DEVICE_NAME);
     dev_major = MAJOR(dev);
@@ -309,13 +311,13 @@ static int _hideproc_init(void)
 static void _hideproc_exit(void)
 {
 
-	
-    device_destroy(hideproc_class,MKDEV(dev_major, MINOR_VERSION)); 
     printk(KERN_INFO "@ %s\n", __func__);
-
-
-
-    /* FIXME: ensure the release of all allocated resources */
+    
+    hook_remove(&hook);
+    device_destroy(hideproc_class,MKDEV(dev_major, MINOR_VERSION)); 
+    //cdev_del(&dev);
+    class_destroy(hideproc_class);
+    unregister_chrdev(dev_major,DEVICE_NAME);
 }
 
 module_init(_hideproc_init);
