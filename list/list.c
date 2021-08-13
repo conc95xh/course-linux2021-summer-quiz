@@ -231,13 +231,19 @@ try_again:
         goto try_again;
     while (true) {
         if (!get_unmarked_node(curr))
-            return false;
+            break;
         next = (list_node_t *) atomic_load(&get_unmarked_node(curr)->next);
         (void) list_hp_protect_ptr(list->hp, HP_NEXT, get_unmarked(next));
-        if (atomic_load(&get_unmarked_node(curr)->next) != (uintptr_t) next)
-            break;
-        if (get_unmarked(next) == atomic_load((atomic_uintptr_t *) &list->tail))
-            break;
+#if 0
+        if (atomic_load(&get_unmarked_node(curr)->next) != (uintptr_t) next) {
+		printf("%s:%s:%d\n", __file__, __fun__, __LINE__);
+		break;
+	}
+        if (get_unmarked(next) == atomic_load((atomic_uintptr_t *) &list->tail)) {
+		printf("%s:%s:%d\n", __file__, __fun__, __LINE__);
+		break;
+	}
+#endif
         if (atomic_load(prev) != get_unmarked(curr))
             goto try_again;
         if (get_unmarked_node(next) == next) {
@@ -259,10 +265,12 @@ try_again:
         curr = next;
         (void) list_hp_protect_release(list->hp, HP_CURR, get_unmarked(next));
     }
+#if 0
     *par_curr = curr;
     *par_prev = prev;
     *par_next = next;
 
+#endif 
     return false;
 }
 
