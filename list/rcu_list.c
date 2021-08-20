@@ -1,6 +1,7 @@
 /* A concurrent linked list utilizing the simplified RCU algorithm */
 
 #include <stdbool.h>
+#include <assert.h>
 
 typedef struct rcu_list rcu_list_t;
 
@@ -64,7 +65,12 @@ static rcu_list_t *list_new_with_deleter(deleter_func_t deleter)
         return NULL;
     }
 
-    list->head = list->tail = NULL;
+    list->head = make_node(NULL);
+    list->tail = make_node(NULL);
+
+    list->head->next = list->tail;
+    list->tail->prev = list->head;
+
     list->zombie_head = NULL;
     list->deleter = deleter;
 
@@ -105,20 +111,13 @@ void list_push_front(rcu_list_t *list, void *data, write_handle_t *handle)
         return;
 
     lock_for_write(list);
+    assert(list->head);
+    assert(list->tail);
 
-    list_node_t *old_head;
-    __atomic_load(&list->head, &old_head, __ATOMIC_RELAXED);
-
-    if (!old_head) {
-        /* list is currently empty */
-        __atomic_store(&list->head, &node, __ATOMIC_SEQ_CST);
-        __atomic_store(&list->tail, &node, __ATOMIC_SEQ_CST);
-    } else {
-        /* general case */
-        __atomic_store(&node->next, &old_head, __ATOMIC_SEQ_CST);
-        __atomic_store(&old_head->prev, &node, __ATOMIC_SEQ_CST);
-        __atomic_store(&list->head, &node, __ATOMIC_SEQ_CST);
-    }
+    __atomic_store(&node->next, &list->head->next, __ATOMIC_SEQ_CST);
+    __atomic_store(&node->prev, &list->head, __ATOMIC_SEQ_CST);
+    __atomic_store(&list->head->next->prev, &node, __ATOMIC_SEQ_CST);
+    __atomic_store(&list->head->next, &node, __ATOMIC_SEQ_CST);
 
     unlock_for_write(list);
 }
@@ -133,14 +132,13 @@ iterator_t list_find(rcu_list_t *list,
         return iter;
 
     list_node_t *current;
-    __atomic_load(&list->head, &current, __ATOMIC_SEQ_CST);
+    __atomic_load(&list->head->next, &current, __ATOMIC_SEQ_CST);
 
-    while (current) {
+    while (current!=list->tail) {
         if (finder(current->data, data)) {
             iter.entry = current;
             break;
         }
-
         __atomic_load(&current->next, &current, __ATOMIC_SEQ_CST);
     }
     return iter;
@@ -286,9 +284,38 @@ static void unlock_for_write(rcu_list_t *list)
     pthread_mutex_unlock(&list->write_lock);
 }
 
+bool list_del_node(rcu_list_t *list, void *data, finder_func_t finder,
+		     write_handle_t *handle)
+{
+
+	/* find node and delete it, but defer the free 
+	 * until our thread is the last reader thread */
+
+	lock_for_write(list);
+	iterator_t iter = list_find(list, data, finder, handle);
+
+	if (!iter.entry)  {
+		unlock_for_write(list);
+		return false;
+	}
+
+        /* remove the node */
+        __atomic_store(&iter.entry->prev->next, &iter.entry->next, __ATOMIC_SEQ_CST);
+        __atomic_store(&iter.entry->next->prev, &iter.entry->prev, __ATOMIC_SEQ_CST);
+
+        unlock_for_write(list);
+
+	/* add ourself as a reader thread to mark the boundary */
+	rcu_read_lock(handle);
+	handle->zombie->zombie = iter.entry;
+	rcu_read_unlock(handle);
+
+    return true;
+}
+
+
 /* test program starts here */
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -305,6 +332,8 @@ static dummy_t *make_dummy(int a, int b)
 
 static bool finder(void *x, void *y)
 {
+
+
     dummy_t *dx = x, *dy = y;
     return (dx->a == dy->a) && (dx->b == dy->b);
 }
@@ -324,46 +353,98 @@ static void *reader_thread(void *arg)
     iter = list_find(list, &(dummy_t){2, 2}, finder, &reader);
     data = iterator_get(&iter);
     assert(data);
-
-    iterator_t first = list_begin(list, &reader);
-    data = iterator_get(&first);
-    assert(data);
-
-    dummy_t *as_d2 = data;
-    assert(as_d2->a == 2);
-    assert(as_d2->b == 2);
-
-    assert(iter.entry == first.entry);
-
     rcu_read_unlock(&reader);
+
+
+    sleep(1);
+
+    while (true) {
+        rcu_read_lock(&reader);
+
+	iter = list_find(list, &(dummy_t){0, 0}, finder, &reader);
+	if (!iter.entry) {
+	    printf("0 not found\n");
+	}
+
+
+	iter = list_find(list, &(dummy_t){1, 1}, finder, &reader);
+	if (!iter.entry) {
+	    printf("1 not found\n");
+	}
+
+	iter = list_find(list, &(dummy_t){2, 2}, finder, &reader);
+
+	if (!iter.entry) {
+	    printf("2 not found\n");
+        }
+
+	iter = list_find(list, &(dummy_t){3, 3}, finder, &reader);
+
+	if (!iter.entry) {
+	    printf("3 not found\n");
+        }
+
+	iter = list_find(list, &(dummy_t){4, 4}, finder, &reader);
+	if (!iter.entry) {
+	    printf("4 not found\n");
+	}
+
+	iter = list_find(list, &(dummy_t){5, 5}, finder, &reader);
+	if (!iter.entry) {
+	    printf("5 not found\n");
+	}
+
+
+
+	rcu_read_unlock(&reader);
+	usleep(random()%5);
+    }
     return NULL;
 }
 
 static void *writer_thread(void *arg)
 {
-    dummy_t *d1 = make_dummy(1, 1);
-    dummy_t *d2 = make_dummy(2, 2);
 
-    rcu_list_t *list = arg;
-    write_handle_t writer = list_register_writer(list);
+	bool ret;
+	rcu_list_t *list = arg;
+	write_handle_t writer = list_register_writer(list);
 
-    rcu_write_lock(&writer);
+	int n;
 
-    /* write to list here */
-    list_push_front(list, d1, &writer);
-    list_push_front(list, d2, &writer);
-
-    rcu_write_unlock(&writer);
-    return NULL;
+	sleep(5);
+	while (true) {
+		n = random()%6;
+		ret =list_del_node(list,&(dummy_t){n, n} , finder,  &writer);
+		printf("ret:%d\n", ret);
+		sleep(1);
+		dummy_t *d1 = make_dummy(n,n);
+	        list_push_front(list, d1, &writer);
+		sleep(1);
+	}
+	return NULL;
 }
 
 #define N_READERS 10
 
 int main(void)
 {
+
+    srandom(time(NULL));
     rcu_list_t *list = list_new();
+
     dummy_t *d0 = make_dummy(0, 0);
+    dummy_t *d1 = make_dummy(1, 1);
+    dummy_t *d2 = make_dummy(2, 2);
+    dummy_t *d3 = make_dummy(3, 3);
+    dummy_t *d4 = make_dummy(4, 4);
+    dummy_t *d5 = make_dummy(5, 5);
+
     list_push_front(list, d0, NULL);
+    list_push_front(list, d1, NULL);
+    list_push_front(list, d2, NULL);
+    list_push_front(list, d3, NULL);
+    list_push_front(list, d4, NULL);
+    list_push_front(list, d5, NULL);
 
     pthread_t t0, t_r[N_READERS];
     pthread_create(&t0, NULL, writer_thread, list);

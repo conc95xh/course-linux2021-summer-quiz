@@ -162,6 +162,8 @@ void list_hp_retire(list_hp_t *hp, uintptr_t ptr)
 #define N_THREADS (64) //Q:NNN
 #define MAX_THREADS 128
 
+pthread_rwlock_t verify_lock;
+
 static atomic_uint_fast32_t deletes = 0, inserts = 0;
 
 enum { HP_NEXT = 0, HP_CURR = 1, HP_PREV };
@@ -361,8 +363,13 @@ static void *insert_thread(void *arg)
 {
     list_t *list = (list_t *) arg;
 
-    for (size_t i = 0; i < N_ELEMENTS; i++)
+
+
+    for (size_t i = 0; i < N_ELEMENTS; i++) {
+    pthread_rwlock_rdlock(&verify_lock);
         (void) list_insert(list, (uintptr_t) &elements[tid()][i]);
+    pthread_rwlock_unlock(&verify_lock);
+    }
     return NULL;
 }
 
@@ -370,23 +377,58 @@ static void *delete_thread(void *arg)
 {
     list_t *list = (list_t *) arg;
 
-    for (size_t i = 0; i < N_ELEMENTS; i++)
+    for (size_t i = 0; i < N_ELEMENTS; i++) {
+	pthread_rwlock_rdlock(&verify_lock);
         (void) list_delete(list, (uintptr_t) &elements[tid()][i]);
+    pthread_rwlock_unlock(&verify_lock);
+    }
+
     return NULL;
 }
+
+static int error=0;
+static void *verify_thread(void *arg)
+{
+    list_t *list = (list_t *) arg;
+
+    pthread_rwlock_wrlock(&verify_lock);
+
+    list_node_t *curr =  list->head;
+    list_node_t *next=  ((list_node_t *)list->head)->next;
+
+    while ( next != list->tail) {
+	    
+	    if (curr->key > next->key) {
+		error++;
+	    }
+	    curr = get_unmarked(curr->next);
+	    next = get_unmarked(curr->next);
+    }
+    pthread_rwlock_unlock(&verify_lock);
+    return NULL;
+}
+
 
 int main(void)
 {
     list_t *list = list_new();
 
     pthread_t thr[N_THREADS];
+    pthread_t tv[N_THREADS];
 
-    for (size_t i = 0; i < N_THREADS; i++)
+    pthread_rwlock_init(&verify_lock,NULL);
+
+    for (size_t i = 0; i < N_THREADS; i++) {
         pthread_create(&thr[i], NULL, (i & 1) ? delete_thread : insert_thread,
                        list);
+	pthread_create(&tv[i], NULL, verify_thread, list);
+    }
 
-    for (size_t i = 0; i < N_THREADS; i++)
+
+    for (size_t i = 0; i < N_THREADS; i++) {
         pthread_join(thr[i], NULL);
+        pthread_join(tv[i], NULL);
+    }
 
     for (size_t i = 0; i < N_ELEMENTS; i++) {
         for (size_t j = 0; j < tid_v_base; j++)
@@ -395,8 +437,8 @@ int main(void)
 
     list_destroy(list);
 
-    fprintf(stderr, "inserts = %zu, deletes = %zu\n", atomic_load(&inserts),
-            atomic_load(&deletes));
+    fprintf(stderr, "inserts = %zu, deletes = %zu error:%zu\n", atomic_load(&inserts),
+            atomic_load(&deletes), error);
 
     return 0;
 }
