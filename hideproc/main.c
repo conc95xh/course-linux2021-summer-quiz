@@ -152,7 +152,7 @@ static int hook_install(struct ftrace_hook *hook)
                       FTRACE_OPS_FL_IPMODIFY;
 
 
-#if 1
+#if 0
 
     err = ftrace_set_filter(&hook->ops, "find_ge_pid", strlen("find_ge_pid"), 0);
     if (err) {
@@ -163,8 +163,8 @@ static int hook_install(struct ftrace_hook *hook)
 	}
 #endif
 
-#if 0
-    err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 1);
+#if 1
+    err = ftrace_set_filter_ip(&hook->ops, (char *)(*hook->pp_orig)+8, 0, 1);
     if (err) {
         printk("ftrace_set_filter_ip() failed: %d\n", err);
         return err;
@@ -174,7 +174,7 @@ static int hook_install(struct ftrace_hook *hook)
     err = register_ftrace_function(&hook->ops);
     if (err) {
         printk("register_ftrace_function() failed: %d\n", err);
-        ftrace_set_filter_ip(&hook->ops, *hook->pp_orig, 1, 0);
+        ftrace_set_filter_ip(&hook->ops, (char *)(*hook->pp_orig)+8, 1, 0);
         return err;
     }
     return 0;
